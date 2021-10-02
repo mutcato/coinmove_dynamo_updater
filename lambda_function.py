@@ -12,23 +12,38 @@ class Metrics:
             "dynamodb", 
             config=Config(read_timeout=585, connect_timeout=585)
         )
-        self.table_name = "metrics"
+        self.table_name = "metrics_test"
         self.table = resource.Table(self.table_name)
+        self.sqs_client = boto3.client('sqs')
 
-    def insert(self, event):    
-        timestamp = int(event["Records"][0]["messageAttributes"]["time"]["stringValue"])
-        response = self.table.put_item(
-            Item={
-                'ticker_interval': event["Records"][0]["body"],
-                'time': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
-                'open': Decimal(event["Records"][0]["messageAttributes"]["open"]["stringValue"]),
-                'high': Decimal(event["Records"][0]["messageAttributes"]["high"]["stringValue"]),
-                'low': Decimal(event["Records"][0]["messageAttributes"]["low"]["stringValue"]),
-                'close': Decimal(event["Records"][0]["messageAttributes"]["close"]["stringValue"]),
-                'volume': Decimal(event["Records"][0]["messageAttributes"]["volume"]["stringValue"]),
-                'number_of_trades': int(event["Records"][0]["messageAttributes"]["number_of_trades"]["stringValue"]),
-                'TTL': timestamp + TTL[event["Records"][0]["messageAttributes"]["interval"]["stringValue"]]
-            }
+    def insert(self, event):
+        records = event["Records"]
+        for record in records:
+            timestamp = int(record["messageAttributes"]["time"]["stringValue"])
+            response = self.table.put_item(
+                Item={
+                    'ticker_interval': record["body"],
+                    'time': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                    'open': Decimal(record["messageAttributes"]["open"]["stringValue"]),
+                    'high': Decimal(record["messageAttributes"]["high"]["stringValue"]),
+                    'low': Decimal(record["messageAttributes"]["low"]["stringValue"]),
+                    'close': Decimal(record["messageAttributes"]["close"]["stringValue"]),
+                    'volume': Decimal(record["messageAttributes"]["volume"]["stringValue"]),
+                    'number_of_trades': int(record["messageAttributes"]["number_of_trades"]["stringValue"]),
+                    'TTL': timestamp + TTL[record["messageAttributes"]["interval"]["stringValue"]]
+                }
+            )
+            print(f"RECORD------->: {record}")
+            print(f"INSERTED:  {response}")
+            deletion = self.delete_from_queue(record["receiptHandle"])
+            print(f"DELETED:  {deletion}")
+
+        
+    def delete_from_queue(self, receipt_handle):
+        queue_url = self.sqs_client.get_queue_url(QueueName="ticker-ohlcv")["QueueUrl"]
+        response = self.sqs_client.delete_message(
+            QueueUrl=queue_url,
+            ReceiptHandle=receipt_handle
         )
         return response
 
@@ -39,11 +54,10 @@ class Summary:
         resource = boto3.resource("dynamodb", config=Config(read_timeout=585, connect_timeout=585))
         self.table = resource.Table(self.table_name)
         self.event = event
-        self.ticker, self.interval_metric = self.get_ticker_interval()
-        self.volume_in_usdt = self.get_volume_in_usdt()
 
-    def get_ticker_interval(self):
-        message_body = self.event["Records"][0]["body"]
+    @staticmethod
+    def get_ticker_interval(record):
+        message_body = record["body"]
         ticker, interval = message_body.rsplit("_", 1)
         """
         Todo: Add a loop to insert other metric types (open, high, low, volume, number_of_trades)
@@ -51,14 +65,17 @@ class Summary:
         interval_metric = interval + "_" + "close"
         return ticker, interval_metric
         
-    def get_volume_in_usdt(self):
-        volume_in_usdt = Decimal(self.event["Records"][0]["messageAttributes"]["close"]["stringValue"]) * Decimal(self.event["Records"][0]["messageAttributes"]["volume"]["stringValue"])
+    @staticmethod
+    def get_volume_in_usdt(record):
+        volume_in_usdt = Decimal(record["messageAttributes"]["close"]["stringValue"]) * Decimal(record["messageAttributes"]["volume"]["stringValue"])
         return volume_in_usdt
 
-    def insert(self):
+    def insert_single(self, record):
+        volume_in_usdt = self.get_volume_in_usdt(record)
+        ticker, interval_metric = self.get_ticker_interval(record)
         try:
             self.table.put_item(
-                Item={"ticker": self.ticker, "interval_metric": self.interval_metric, "volume_in_usdt": self.volume_in_usdt},
+                Item={"ticker": ticker, "interval_metric": interval_metric, "volume_in_usdt": volume_in_usdt},
                 ConditionExpression="attribute_not_exists(ticker) AND attribute_not_exists(interval_metric)"
             )
         except botocore.exceptions.ClientError as e:
@@ -67,10 +84,15 @@ class Summary:
             if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
                 raise
 
+    def insert(self):
+        for record in self.event["Records"]:
+            self.insert_single(record)
+
 def lambda_handler(event, context):
     print("EVENT: ")
     print(event)
-    metrics = Metrics()
     summary = Summary(event)
-    metrics.insert(event)
     summary.insert()
+        
+    metrics = Metrics()
+    metrics.insert(event)
